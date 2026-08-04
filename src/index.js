@@ -14,12 +14,15 @@ import { chatWithAi } from "./ai.js";
 import { gatherIntel } from "./profile.js";
 import { isStaff, clearWarnings, getUserRecord } from "./moderation.js";
 import { canUseAi, claimMessage, releaseMessage } from "./store.js";
-import { addKeys, listKeysMasked, removeKey, getKeyCount } from "./keys.js";
+import { addKeys, listKeysMasked, removeKey, getKeyCount, getHealthyKeyCount } from "./keys.js";
 import { initMusic, initMusicNodes, updateMusicVoiceState, joinVoice, playMusic, selectMusic, controlMusic, hasPendingMusicSearch } from "./music.js";
 import { getBotIdentity } from "./identity.js";
 import { handleDmChatCommand, handleDmChatInteraction } from "./dm-chat.js";
 import { runDiscordInspect } from "./discord-tools.js";
 import { inspectMrBeastScam } from "./scam-vision.js";
+import { startNarration, stopNarration } from "./narration.js";
+import { identifyLyrics } from "./lyrics.js";
+import { handleVoiceCommand, sendVietnameseVoiceMessage } from "./voice-message.js";
 
 function splitDiscordText(text, maxLength = 1900) {
   const remaining = String(text || "").trim();
@@ -52,6 +55,7 @@ initMusic(client);
 
 client.once(Events.ClientReady, (c) => {
   console.log(`✅ Online: ${c.user.tag}`);
+  console.log(`[vision] provider=${config.openRouter.apiKey ? "OpenRouter" : "xKiro fallback"} model=${config.openRouter.apiKey ? config.openRouter.visionModel : config.ai.visionModel}`);
   const identity = getBotIdentity(c.user.id);
   c.user.setActivity(`${identity.name} · DeepSeek brain · var all`, {
     type: ActivityType.Watching,
@@ -118,6 +122,11 @@ client.on(Events.MessageCreate, async (message) => {
       return;
     }
 
+    if (/^\.voice\b/i.test(content.trim())) {
+      await handleVoiceCommand(message);
+      return;
+    }
+
     // ── 2) Lệnh mod staff (kick/warn tay — không auto-filter) ─────────
     if (content.startsWith("!mod ")) {
       await handleModCommands(message);
@@ -151,20 +160,22 @@ client.on(Events.MessageCreate, async (message) => {
     const naturalMusicIntent =
       /\b(join|vào|vô|tham gia|kết nối|mở|phát|bật|nghe|skip|bỏ bài|dừng|pause|resume|âm lượng|volume|rời|out)\b[\s\S]{0,80}\b(voice|room|phòng|nhạc|music|bài)\b/i.test(content) ||
       /\b(voice|room|phòng|nhạc|music|bài)\b[\s\S]{0,80}\b(join|vào|vô|mở|phát|bật|nghe|skip|dừng|rời|out)\b/i.test(content);
-    const looksLikeMusicLink = /https?:\/\/(?:www\.)?(?:youtube\.com|youtu\.be|music\.youtube\.com|open\.spotify\.com|soundcloud\.com|tiktok\.com)\//i.test(content.trim());
+    const naturalNarrationIntent = /(?:kể|đọc)[\s\S]{0,80}(?:truyện|chuyện)[\s\S]{0,80}(?:voice|phòng)|(?:join|vào|vô)[\s\S]{0,60}(?:voice|phòng)[\s\S]{0,80}(?:kể|đọc)|(?:dừng|ngưng)[\s\S]{0,30}(?:kể|truyện|chuyện)/i.test(content);
     const pendingMusicChoice = hasPendingMusicSearch(message) && /^\s*(?:chọn\s*)?[1-5]\s*$/i.test(content);
 
+    const targetsAnotherBot = !mentionedBot && message.mentions.users.some((user) => user.bot && user.id !== client.user.id);
     const shouldChat =
+      !targetsAnotherBot && (
       !config.requireMention ||
       mentionedBot ||
       isReplyToBot ||
       toxic ||
       naturalMusicIntent ||
-      looksLikeMusicLink ||
+      naturalNarrationIntent ||
       pendingMusicChoice ||
       (hasImages && mentionedBot) ||
       content.toLowerCase().startsWith("!chat ") ||
-      content.toLowerCase().startsWith("!ai ");
+      content.toLowerCase().startsWith("!ai "));
 
     if (!shouldChat) return;
 
@@ -237,6 +248,10 @@ client.on(Events.MessageCreate, async (message) => {
           select_music: (args) => selectMusic(message, args.index),
           control_music: (args) => controlMusic(message, args.action, args.value),
           discord_inspect: (args) => runDiscordInspect(message, args),
+          speak_voice: (args) => sendVietnameseVoiceMessage(message.channel.id, args.text, { gender: args.gender }),
+          narrate_voice: (args) => startNarration(message, args),
+          stop_narration: () => stopNarration(message.guild.id),
+          identify_lyrics: (args) => identifyLyrics(message, args.url),
         },
       });
 
@@ -357,7 +372,7 @@ async function handleApiCommands(message) {
       return;
     }
     await message.reply(
-      ["**API pool:**", ...list.map((k) => `\`${k.index}\` → \`${k.masked}\``), `_total ${list.length}_`].join(
+      ["**API pool:**", ...list.map((k) => `\`${k.index}\` → \`${k.masked}\` · ${k.status}`), `_healthy ${getHealthyKeyCount()}/${list.length}_`].join(
         "\n"
       )
     );
@@ -464,7 +479,7 @@ async function handleModCommands(message) {
 }
 
 client.on(Events.GuildCreate, (guild) => {
-  console.log(`➕ joined: ${guild.name} (${guild.id})`);
+  console.log(`âž• joined: ${guild.name} (${guild.id})`);
 });
 
 process.on("unhandledRejection", (e) => console.error("unhandledRejection", e));
@@ -472,6 +487,7 @@ process.on("uncaughtException", (e) => console.error("uncaughtException", e));
 
 console.log("Booting…");
 client.login(config.discordToken);
+
 
 
 

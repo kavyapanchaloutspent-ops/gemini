@@ -5,9 +5,11 @@ import { generateImage } from "./images.js";
 import { deployToSurge, redactSecrets } from "./surge.js";
 import {
   acquireKey,
-  rotateKey,
   shouldRotateOnError,
   getKeyCount,
+  getHealthyKeyCount,
+  reportKeyFailure,
+  reportKeySuccess,
   initKeyPool,
   maskKey,
 } from "./keys.js";
@@ -28,6 +30,18 @@ try {
 
 /** Cache client theo key — đỡ tạo object mỗi lần */
 const clientCache = new Map();
+let openRouterVisionClient = null;
+
+function getOpenRouterVisionClient() {
+  if (!config.openRouter.apiKey) return null;
+  if (!openRouterVisionClient) {
+    openRouterVisionClient = new OpenAI({
+      apiKey: config.openRouter.apiKey,
+      baseURL: config.openRouter.baseURL,
+    });
+  }
+  return openRouterVisionClient;
+}
 
 /** Timeout mỗi attempt (ms) — fail nhanh để nhảy key, không treo 90s */
 const AI_TIMEOUT_MS = Number(process.env.AI_TIMEOUT_MS || 40_000);
@@ -124,7 +138,7 @@ function buildBody(params, attempt) {
   };
 }
 
-/** 1 shot với 1 key */
+/** 1 shot vá»›i 1 key */
 async function oneShot(params, key, attempt, timeoutMs) {
   const client = makeClient(key, timeoutMs);
   const { body, nonce } = buildBody(params, attempt);
@@ -138,7 +152,8 @@ async function oneShot(params, key, attempt, timeoutMs) {
  */
 async function createChatRace(params) {
   const t0 = Date.now();
-  const keys = [acquireKey(), acquireKey()];
+  const firstKey = acquireKey();
+  const keys = [firstKey, acquireKey([firstKey])];
   const errors = [];
 
   return await new Promise((resolve, reject) => {
@@ -153,6 +168,7 @@ async function createChatRace(params) {
           if (done) return;
           const { res } = await oneShot(params, key, i, AI_TIMEOUT_MS);
           if (!done) {
+            reportKeySuccess(key);
             done = true;
             console.log(
               `[ai] race win key=${maskKey(key)} ${Date.now() - t0}ms`
@@ -160,6 +176,7 @@ async function createChatRace(params) {
             resolve(res);
           }
         } catch (err) {
+          reportKeyFailure(key, err);
           errors.push(err);
           const msg = String(err?.message || err).slice(0, 80);
           console.warn(`[ai] race lose key=${maskKey(key)}: ${msg}`);
@@ -183,7 +200,7 @@ async function createChatRace(params) {
  */
 async function createChatSerial(params, { retries = 4 } = {}) {
   let lastErr;
-  const pool = Math.max(1, getKeyCount());
+  const pool = Math.max(1, getHealthyKeyCount());
   // timeout: thử hết pool + thêm vài vòng
   const maxAttempts = Math.min(Math.max(retries, pool + 2), 10);
 
@@ -194,11 +211,13 @@ async function createChatSerial(params, { retries = 4 } = {}) {
 
     try {
       const { res } = await oneShot(params, key, attempt, timeoutMs);
+      reportKeySuccess(key);
       if (attempt > 0) {
         console.log(`[ai] ok after retry a${attempt} key=${maskKey(key)}`);
       }
       return res;
     } catch (err) {
+      reportKeyFailure(key, err);
       lastErr = err;
       const msg = String(err?.message || err).slice(0, 120);
       const dupe = isDuplicate409(err);
@@ -213,11 +232,6 @@ async function createChatSerial(params, { retries = 4 } = {}) {
 
       if (!isRetryable(err) && attempt >= 1) throw err;
       if (attempt >= maxAttempts - 1) break;
-
-      // timeout / 409 / 401 / 429 → nhảy key ngay
-      if (pool > 1 && (tout || dupe || rate || shouldRotateOnError(err))) {
-        rotateKey(tout ? "timeout" : dupe ? "409" : rate ? "429" : msg);
-      }
 
       // chờ ngắn — timeout không sleep lâu (đã tốn 40s)
       const wait = tout
@@ -239,7 +253,7 @@ async function createChatSerial(params, { retries = 4 } = {}) {
  */
 async function createChat(params, opts = {}) {
   const hasTools = Array.isArray(params.tools) && params.tools.length > 0;
-  if (!hasTools && getKeyCount() >= 2 && opts.race !== false) {
+  if (!hasTools && getHealthyKeyCount() >= 2 && opts.race !== false) {
     try {
       return await createChatRace(params);
     } catch (e) {
@@ -270,6 +284,8 @@ NHÂN CÁCH DUY NHẤT + MEMORY:
 
 CÔNG CỤ:
 1) look_at_images — mắt (avatar/ảnh).
+   Nếu tool trả ok=false hoặc nói ảnh không tải được/không rõ: PHẢI nói không xem được; CẤM đoán avatar từ URL, thumbnail, tên file, label hay stereotype.
+   Nếu user bảo "xem lại" nhưng catalog không có đúng target cũ: hỏi họ mention hoặc gửi Discord ID; CẤM lấy avatar author rồi giả làm target khác.
 2) generate_image — vẽ FLUX. Trong bot-var có thể tự tạo ảnh/meme làm đòn đáp nếu thật sự có ý tưởng; hoàn toàn tùy chọn, không gọi cho đủ thủ tục.
 3) deploy_static_site — CHỈ khi backend chưa auto-deploy. Ưu tiên description ngắn; hệ thống gen HTML + Surge.
 4) join_voice — vào đúng phòng voice của người đang nhắn.
@@ -287,6 +303,10 @@ QUAN TRỌNG VỀ WEB:
 Bạn luôn output cuối. BOT IDENTITY là nguồn danh tính cao nhất.`;
 
 const TOOLS = [
+  { type: "function", function: { name: "narrate_voice", description: "Bắt đầu kể chuyện dài trực tiếp và liên tục trong phòng voice của user. Dùng khi user yêu cầu join voice kể truyện; hỗ trợ tối đa 60 phút và tự giữ mạch truyện qua nhiều chương.", parameters: { type: "object", properties: { topic: { type: "string", description: "Chủ đề, thể loại, nhân vật hoặc yêu cầu câu chuyện." }, duration_minutes: { type: "integer", minimum: 1, maximum: 60 }, gender: { type: "string", enum: ["female", "male"] } }, required: ["topic", "duration_minutes"] } } },
+  { type: "function", function: { name: "stop_narration", description: "Dừng phiên kể chuyện đang phát trong voice khi user yêu cầu dừng/ngưng kể.", parameters: { type: "object", properties: {} } } },
+  { type: "function", function: { name: "identify_lyrics", description: "Nhận diện bài hát từ link YouTube/TikTok bằng metadata audio node rồi đối chiếu cơ sở dữ liệu lời. Dùng khi user hỏi tên bài, nhận diện lyric/lời từ link; không dùng để phát nhạc.", parameters: { type: "object", properties: { url: { type: "string", description: "URL YouTube hoặc TikTok nguyên bản." } }, required: ["url"] } } },
+  { type: "function", function: { name: "speak_voice", description: "Tạo và gửi Voice Message Discord thật bằng giọng đọc tiếng Việt khi user yêu cầu gửi voice, nói hoặc đọc thành tiếng.", parameters: { type: "object", properties: { text: { type: "string", description: "Nội dung tiếng Việt cần đọc, tối đa khoảng 900 ký tự." }, gender: { type: "string", enum: ["female", "male"], description: "Giọng nữ hoặc nam; mặc định nữ." } }, required: ["text"] } } },
   {
     type: "function",
     function: {
@@ -443,7 +463,7 @@ function extractHtmlFromText(text) {
 
 function repairRoastEnding(text, userId) {
   let s = String(text || "")
-    .replace(/["“”]+/g, "")
+    .replace(/["""]+/g, "")
     .replace(/\s+/g, " ")
     .trim();
   const hasCompleteEnding = /(?:[.!?]|=\)+)$/u.test(s);
@@ -570,7 +590,7 @@ async function runLookAtImagesTool(visionItems, { focus = "all", question = "" }
   } else if (focus === "author_avatar") {
     items = items.filter((i) => i.kind === "author");
   } else if (focus === "others_avatar") {
-    items = items.filter((i) => i.kind === "mentioned" || i.kind === "reply_to");
+    items = items.filter((i) => i.kind === "mentioned" || i.kind === "reply_to" || i.kind === "explicit_id");
   }
 
   if (!items.length) {
@@ -590,34 +610,43 @@ async function runLookAtImagesTool(visionItems, { focus = "all", question = "" }
     .join("\n");
 
   try {
-    const response = await createChat({
-      model: config.ai.visionModel,
-      messages: [
-        {
-          role: "system",
-          content: `You are a silent vision SENSOR (Mistral Large) for Grok. Output factual Vietnamese descriptions only. Never speak as a chatbot, never address the end user.
+    const visionMessages = [
+      {
+        role: "system",
+        content: `You are a silent vision SENSOR for a Discord bot. Output factual Vietnamese descriptions only. Never speak as a chatbot and never address the end user.
 Rules:
-- Start each block with the exact label given (e.g. "AVATAR CỦA NGƯỜI ĐANG NHẮN: ...").
-- author = person currently messaging.
-- mentioned/reply_to = other person.
-- attachment = uploaded image.
+- Start each block with the exact supplied label.
+- author = person currently messaging; mentioned/reply_to = another person; attachment = uploaded image.
+- Describe only pixels actually visible. Never infer appearance from URL, filename, label, username, prior text, or stereotypes.
+- If an image cannot be loaded or is too unclear, output exactly that label followed by "KHÔNG XEM ĐƯỢC ẢNH". Never fabricate.
 No moralizing. No preamble.`,
-        },
-        {
-          role: "user",
-          content: visionUserContent(
-            [
-              question ? `Yêu cầu phân tích: ${question}` : "Mô tả chi tiết từng ảnh.",
-              "DANH SÁCH:",
-              legend,
-            ].join("\n"),
-            items.map((i) => i.url)
-          ),
-        },
-      ],
-      temperature: 0.3,
-      max_tokens: 900,
-    });
+      },
+      {
+        role: "user",
+        content: visionUserContent(
+          [
+            question ? `Yêu cầu phân tích: ${question}` : "Mô tả chi tiết từng ảnh.",
+            "DANH SÁCH:",
+            legend,
+          ].join("\n"),
+          items.map((i) => i.url)
+        ),
+      },
+    ];
+    const openRouter = getOpenRouterVisionClient();
+    const response = openRouter
+      ? await openRouter.chat.completions.create({
+          model: config.openRouter.visionModel,
+          messages: visionMessages,
+          temperature: 0.15,
+          max_tokens: 700,
+        })
+      : await createChat({
+          model: config.ai.visionModel,
+          messages: visionMessages,
+          temperature: 0.15,
+          max_tokens: 700,
+        });
 
     const description = response.choices?.[0]?.message?.content?.trim() || "";
     return JSON.stringify({
@@ -626,14 +655,15 @@ No moralizing. No preamble.`,
       count: items.length,
       labels: items.map((i) => ({ kind: i.kind, label: i.label, name: i.name })),
       description,
-      note: "Đây là dữ liệu cảm biến. DeepSeek hãy trả lời user bằng nhân cách của mình, có memory.",
+      note: description.includes("KHÔNG XEM ĐƯỢC ẢNH") ? "Vision không tải/không thấy ảnh. CẤM đoán; hãy nói rõ không xem được." : "Đây là dữ liệu cảm biến thật. Hãy trả lời bằng nhân cách của mình.",
     });
   } catch (err) {
     console.error("[tool look_at_images]", err.message);
     return JSON.stringify({
       ok: false,
-      error: err.message,
-      labels: items.map((i) => ({ kind: i.kind, label: i.label, url: i.url })),
+      error: `Vision không xem được ảnh: ${err.message}`,
+      instruction: "CẤM đoán nội dung/avatar. Hãy nói thẳng với user là không tải được ảnh.",
+      labels: items.map((i) => ({ kind: i.kind, label: i.label })),
     });
   }
 }
@@ -696,6 +726,8 @@ export async function chatWithAi({
   const historyUser = `[${userName}]: ${String(content).slice(0, 800)}`;
   pushHistory(channelId, "user", historyUser, config.historyLimit);
 
+  const explicitVisionIntent =
+    /(?:xem|soi|nhìn|check|phân tích|mô tả|đọc|nhận diện)[\s\S]{0,40}(?:ảnh|hình|avatar|\bav\b)|(?:ảnh|hình|avatar|\bav\b)[\s\S]{0,40}(?:xem|soi|nhìn|check|phân tích|mô tả|đọc|nhận diện)|\b(?:xem|soi|nhìn)\s+lại\b/i.test(String(content || ""));
   const isBotVarTurn = /\[BOT VAR/i.test(String(content || ""));
   const isToxicTurn = /\[(?:TOXIC|BOT VAR)/i.test(String(content || ""));
   const history = getHistory(channelId);
@@ -726,7 +758,14 @@ export async function chatWithAi({
       model: config.ai.model,
       messages,
       tools: turnTools,
-      tool_choice: turnTools?.length ? "auto" : undefined,
+      tool_choice:
+        turnTools?.length && guard > 1
+          ? "none"
+          : turnTools?.length && explicitVisionIntent && visionItems?.length
+            ? { type: "function", function: { name: "look_at_images" } }
+            : turnTools?.length
+              ? "auto"
+              : undefined,
       // toxic: nhiệt cao hơn = gắt/tục hơn; chat thường giữ 0.9
       temperature: isToxicTurn ? 1.1 : 0.9,
       max_tokens: isToxicTurn ? 480 : preDeployUrl ? 1024 : 4096,
@@ -766,7 +805,7 @@ export async function chatWithAi({
 
         let toolResult = "";
 
-        if (name === "join_voice" || name === "play_music" || name === "select_music" || name === "control_music" || name === "discord_inspect") {
+        if (name === "join_voice" || name === "play_music" || name === "select_music" || name === "control_music" || name === "discord_inspect" || name === "speak_voice" || name === "narrate_voice" || name === "stop_narration" || name === "identify_lyrics") {
           try {
             const handler = toolHandlers[name];
             if (!handler) throw new Error("Music tool chưa sẵn sàng.");
@@ -848,13 +887,35 @@ export async function chatWithAi({
     finalText = stripHugeHtml(finalText);
   }
 
+  // Một số OpenAI-compatible model trả tool result xong lại trả content rỗng.
+  // Recovery không kèm tools để buộc model tổng hợp kết quả thay vì gọi tool lặp vô hạn.
+  if (!finalText && !isToxicTurn && !preDeployUrl && !images.length) {
+    try {
+      const recovery = await createChat({
+        model: config.ai.model,
+        messages: [
+          ...messages,
+          {
+            role: "system",
+            content: "Trả lời user ngay bằng tiếng Việt dựa trên tool result vừa có. Không gọi thêm tool. Nếu tool lỗi/không thấy ảnh thì nói đúng điều đó, tuyệt đối không bịa.",
+          },
+        ],
+        temperature: 0.5,
+        max_tokens: 1800,
+      });
+      finalText = String(recovery.choices?.[0]?.message?.content || "").trim();
+      if (finalText) console.log("[ai] recovered empty tool response");
+    } catch (error) {
+      console.error("[ai recovery]", redactSecrets(error?.message || String(error)));
+    }
+  }
   if (isToxicTurn && finalText) finalText = repairRoastEnding(finalText, userId);
 
   if (!finalText) {
     if (isToxicTurn) finalText = repairRoastEnding("", userId);
     else if (preDeployUrl) finalText = `xong — web đây: ${preDeployUrl}`;
     else if (images.length) finalText = "xong — check ảnh 👇";
-    else finalText = "ờ... lag, nói lại cái.";
+    else finalText = "Model vừa trả response rỗng; gửi lại câu đó một lần giúp tao.";
   }
 
   // đảm bảo có link nếu đã deploy
@@ -893,3 +954,20 @@ export function quickHeuristicFlags() {
 
 
 
+
+
+export async function generateStoryChapter({ topic, continuity = "", previousEnding = "", chapter = 1 }) {
+  const response = await createChatSerial({
+    model: config.ai.model,
+    temperature: 0.82,
+    max_tokens: 2600,
+    response_format: { type: "json_object" },
+    messages: [
+      { role: "system", content: "Bạn là biên kịch kiêm người kể chuyện Việt Nam chuyên nghiệp. Viết để đọc thành tiếng: tự nhiên, giàu không khí, không tiêu đề chen giữa lời kể. Giữ tuyệt đối tên nhân vật, luật thế giới, thời gian và các chi tiết đã thiết lập. Mỗi chương 2500-4000 ký tự. Trả JSON đúng dạng {\"narration\":\"...\",\"continuity\":\"tóm tắt cô đọng nhân vật, bí mật, diễn biến và móc nối chương sau\"}. Không kết thúc truyện trừ khi được báo đây là chương cuối." },
+      { role: "user", content: `Chủ đề/yêu cầu: ${topic}\nChương: ${chapter}\nStory bible hiện tại: ${continuity || "chưa có"}\nĐoạn kết chương trước: ${previousEnding || "mở đầu truyện"}\nViết chương tiếp theo liền mạch, có cao trào nhỏ và móc nối tự nhiên.` }
+    ]
+  }, { retries: 4 });
+  const raw=String(response.choices?.[0]?.message?.content||"").trim();
+  try { const data=JSON.parse(raw); if(data.narration)return {narration:String(data.narration),continuity:String(data.continuity||continuity)}; } catch {}
+  return { narration: raw || "Đêm ấy, mọi thứ bắt đầu bằng một tiếng gõ cửa rất khẽ.", continuity };
+}
