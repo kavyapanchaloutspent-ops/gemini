@@ -31,10 +31,10 @@ export const config = {
       "",
     /** Nexus OpenAI-compatible */
     baseURL: process.env.AI_BASE_URL || "https://api.nexusapi.co/v1",
-    /** Model chính — mặc định grok-4.5-high (nhanh + tiết kiệm hơn 4.6) */
-    model: process.env.AI_MODEL || "grok-4.5-high",
+    /** Model chính — grok-4.6 (ít refuse roast hơn 4.5-high) */
+    model: process.env.AI_MODEL || "grok-4.6",
     /** Fallback vision/chat model string */
-    visionModel: process.env.AI_VISION_MODEL || "grok-4.5-high",
+    visionModel: process.env.AI_VISION_MODEL || "grok-4.6",
     /** Reasoning budget (chỉ NVIDIA Nemotron) */
     reasoningBudget: Number(process.env.AI_REASONING_BUDGET || 512),
     /** Output cap — thấp để kéo 100M token ≥6 ngày */
@@ -55,7 +55,7 @@ export const config = {
       process.env.NVIDIA_API_KEY ||
       "",
     baseURL: process.env.NVIDIA_VISION_BASE_URL || process.env.AI_BASE_URL || "https://api.nexusapi.co/v1",
-    model: process.env.NVIDIA_VISION_MODEL || process.env.AI_VISION_MODEL || "grok-4.5-high",
+    model: process.env.NVIDIA_VISION_MODEL || process.env.AI_VISION_MODEL || "grok-4.6",
     timeoutMs: Number(process.env.NVIDIA_VISION_TIMEOUT_MS || 15_000),
   },
   /** Optional: OpenRouter chỉ cho scam-vision (không phải chat chính) */
