@@ -1,9 +1,9 @@
 import { config } from "./config.js";
 const keys=[];const health=new Map();const verified=new Set();let cursor=0;
 const normalizeKey=k=>String(k||"").trim().replace(/^["']|["']$/g,"");
-const isValidKey=k=>{const s=normalizeKey(k);return s.length>=20&&/^(?:sk-(?:xt-)?|nvapi-)/i.test(s);};
+const isValidKey=k=>{const s=normalizeKey(k);return s.length>=20&&/^(?:sk-(?:xt-)?|nvapi-|g2a_)/i.test(s);};
 export function maskKey(k){const s=normalizeKey(k);return s.length<12?"***":`${s.slice(0,7)}…${s.slice(-4)}`;}
-function uniquePush(k){const s=normalizeKey(k);if(!isValidKey(s))return{ok:false,reason:"key không hợp lệ (cần sk- / sk-xt- …)"};if(keys.includes(s))return{ok:false,reason:"key đã có trong pool",key:s,masked:maskKey(s)};keys.unshift(s);cursor=0;return{ok:true,key:s,masked:maskKey(s),index:0};}
+function uniquePush(k){const s=normalizeKey(k);if(!isValidKey(s))return{ok:false,reason:"key không hợp lệ (cần g2a_ / nvapi- / sk- …)"};if(keys.includes(s))return{ok:false,reason:"key đã có trong pool",key:s,masked:maskKey(s)};keys.unshift(s);cursor=0;return{ok:true,key:s,masked:maskKey(s),index:0};}
 export function initKeyPool(){keys.length=0;health.clear();verified.clear();cursor=0;const fromList=(process.env.AI_API_KEYS||"").split(/[\s,;]+/).map(normalizeKey).filter(Boolean);for(const k of [config.ai.apiKey,...fromList].filter(Boolean))uniquePush(k);if(!keys.length)throw new Error("Không có AI API key nào (AI_API_KEY / AI_API_KEYS)");cursor=0;console.log(`[keys] pool = ${keys.length} key(s), newest-first: ${keys.map(maskKey).join(", ")}`);return keys.length;}
 function stateOf(k){const s=health.get(k);if(!s)return null;if(s.until!==Infinity&&s.until<=Date.now()){health.delete(k);return null;}return s;}
 export function getKeyCount(){return keys.length;}

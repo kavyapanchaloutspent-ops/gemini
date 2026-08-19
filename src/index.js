@@ -199,9 +199,11 @@ client.on(Events.MessageCreate, async (message) => {
 
     if (toxic) {
       prompt = [
-        isBotVar ? "[BOT VAR — ĐỐI THỦ LÀ BOT KHÁC, CHỬI NÁT NÓ]" : "[TOXIC — BẬT MAX ROAST]",
-        "User đang chửi/gáy/toxic. Đáp cực gắt và tục, nhưng tự do sáng tạo cách đánh, nhịp câu và punchline; đừng rập khuôn danh sách từ có sẵn.",
-        `Chửi NGẮN 2–4 câu nhưng cực tục, mỗi câu có lực và không lặp ý. Tag người đang nhắn bằng <@${message.author.id}> đúng 1 lần. CẤM emoji/icon; dùng =)) để cười khinh. Nhớ context chat.`,
+        isBotVar
+          ? "[BOT VAR — CHỬI NÁT BOT ĐỐI THỦ]"
+          : "[TOXIC — MAX PAIN]",
+        "Chửi siêu tục, hủy ego, lôi bộ phận ra chửi nếu hợp ngữ cảnh. 3–5 câu ngắn, đậm đặc, punchline chết người. Không soft.",
+        `Tag <@${message.author.id}> đúng 1 lần. CẤM emoji; dùng =)).`,
         "",
         prompt,
       ].join("\n");

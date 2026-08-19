@@ -30,30 +30,37 @@ try {
 
 /** Cache client theo key — đỡ tạo object mỗi lần */
 const clientCache = new Map();
-let openRouterVisionClient = null;
+let nvidiaVisionClient = null;
 
-function getOpenRouterVisionClient() {
-  if (!config.openRouter.apiKey) return null;
-  if (!openRouterVisionClient) {
-    openRouterVisionClient = new OpenAI({
-      apiKey: config.openRouter.apiKey,
-      baseURL: config.openRouter.baseURL,
+/** NVIDIA vision riêng (Gemma / model vision) — không nhầm OpenRouter */
+function getNvidiaVisionClient() {
+  if (!config.vision.apiKey) return null;
+  if (!nvidiaVisionClient) {
+    nvidiaVisionClient = new OpenAI({
+      apiKey: config.vision.apiKey,
+      baseURL: config.vision.baseURL || config.ai.baseURL,
+      timeout: config.vision.timeoutMs || 20_000,
+      maxRetries: 0,
     });
   }
-  return openRouterVisionClient;
+  return nvidiaVisionClient;
 }
+// alias cũ (code khác có thể còn gọi tên này)
+const getOpenRouterVisionClient = getNvidiaVisionClient;
 
-/** Timeout mỗi attempt (ms) — fail nhanh để nhảy key, không treo 90s */
-const AI_TIMEOUT_MS = Number(process.env.AI_TIMEOUT_MS || 40_000);
+/** Timeout mỗi attempt (ms) — grok-4.5-high + effort low ~6–10s */
+const AI_TIMEOUT_MS = Number(process.env.AI_TIMEOUT_MS || 20_000);
+const isNvidiaEndpoint = () => /integrate\.api\.nvidia\.com/i.test(config.ai.baseURL);
+const isNexusEndpoint = () => /api\.nexusapi\.co/i.test(config.ai.baseURL);
 
 function makeClient(apiKey, timeoutMs = AI_TIMEOUT_MS) {
-  const cacheKey = `${apiKey}|${timeoutMs}`;
+  const cacheKey = `${apiKey}|${timeoutMs}|${config.ai.baseURL}`;
   if (clientCache.has(cacheKey)) return clientCache.get(cacheKey);
   const c = new OpenAI({
     apiKey,
     baseURL: config.ai.baseURL,
     timeout: timeoutMs,
-    maxRetries: 0, // tự retry — tránh SDK double-fire gây 409
+    maxRetries: 0, // tự retry — tránh SDK double-fire
   });
   clientCache.set(cacheKey, c);
   return c;
@@ -71,7 +78,7 @@ function isDuplicate409(err) {
 
 function isRateLimit(err) {
   const status = err?.status || err?.response?.status || err?.statusCode;
-  return status === 429 || /rate limit|too many/i.test(String(err?.message || ""));
+  return status === 429 || /rate limit|too many|quota/i.test(String(err?.message || ""));
 }
 
 function isTimeout(err) {
@@ -92,17 +99,17 @@ function isRetryable(err) {
   const status = err?.status || err?.response?.status || err?.statusCode;
   if (status >= 500 && status <= 599) return true;
   const msg = String(err?.message || err || "");
+  // NVIDIA free tier hay trả 400 khi param lạ — không retry vô hạn
   if (/ECONN|fetch failed|network|socket|503|502|504/i.test(msg)) return true;
   return false;
 }
 
 function reqId(attempt = 0) {
-  return `gx_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 9)}_a${attempt}`;
+  return `nv_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 9)}_a${attempt}`;
 }
 
 /**
- * Clone messages + gắn nonce ẩn vào lượt user cuối
- * → body hash khác nhau mỗi attempt (gateway anti-dupe).
+ * Clone messages + nonce ngắn (anti-dupe gateway) — giữ gọn để đỡ tốn token NVIDIA.
  */
 function withNonceMessages(messages, nonce) {
   if (!Array.isArray(messages) || !messages.length) return messages;
@@ -111,41 +118,82 @@ function withNonceMessages(messages, nonce) {
   if (last?.role === "user" && typeof last.content === "string") {
     out[out.length - 1] = {
       ...last,
-      content: `${last.content}\n\n<!-- ${nonce} -->`,
+      content: `${last.content}\n<!--${nonce}-->`,
     };
   } else if (last?.role === "user" && Array.isArray(last.content)) {
     out[out.length - 1] = {
       ...last,
-      content: [...last.content, { type: "text", text: `<!-- ${nonce} -->` }],
+      content: [...last.content, { type: "text", text: `<!--${nonce}-->` }],
     };
   } else {
-    out.push({ role: "user", content: `<!-- ${nonce} -->` });
+    out.push({ role: "user", content: `<!--${nonce}-->` });
   }
   return out;
 }
 
+/**
+ * Body tối ưu NVIDIA integrate.api.nvidia.com:
+ * - luôn có max_tokens (một số model NIM bắt buộc)
+ * - chat_template_kwargs / reasoning_budget CHỈ cho Nemotron (model khác 400)
+ * - toxic/fast: tắt thinking cho nhanh
+ * - top_p ổn định
+ */
 function buildBody(params, attempt) {
   const nonce = reqId(attempt);
-  const isNvidia = /integrate\.api\.nvidia\.com/i.test(config.ai.baseURL);
-  return {
-    body: {
-      ...params,
-      model: params.model || config.ai.model,
-      messages: withNonceMessages(params.messages, nonce),
-      seed: Math.floor(Math.random() * 2_000_000_000),
-      user: nonce,
-      ...(isNvidia
-        ? {
-            chat_template_kwargs: { enable_thinking: true },
-            reasoning_budget: Number(process.env.AI_REASONING_BUDGET || 4096),
-          }
-        : {}),
-    },
-    nonce,
+  const model = params.model || config.ai.model;
+  const isNemotron = /nemotron/i.test(model);
+  const noThinking =
+    params.__noThinking === true || config.ai.enableThinking === false;
+
+  // clone params, bỏ flag nội bộ
+  const { __noThinking, ...rest } = params;
+
+  /** @type {Record<string, unknown>} */
+  const body = {
+    ...rest,
+    model,
+    messages: withNonceMessages(params.messages, nonce),
+    // NVIDIA: max_tokens nên luôn có (một số model NIM bắt buộc)
+    max_tokens: params.max_tokens ?? config.ai.maxTokens ?? 2048,
+    temperature: params.temperature ?? 0.7,
+    top_p: params.top_p ?? 0.9,
+    seed: Math.floor(Math.random() * 2_000_000_000),
+    user: nonce,
   };
+
+  if (isNvidiaEndpoint() && isNemotron) {
+    const enableThinking = !noThinking;
+    body.chat_template_kwargs = { enable_thinking: enableThinking };
+    if (enableThinking) {
+      // budget vừa: reasoning đủ, bớt timeout so với 4096
+      body.reasoning_budget = config.ai.reasoningBudget || 2048;
+    }
+  }
+
+  // Nexus Grok: low effort = nhanh hơn + ít completion/reasoning token
+  if (isNexusEndpoint() && /grok/i.test(model)) {
+    body.reasoning_effort = process.env.AI_REASONING_EFFORT || "low";
+  }
+
+  return { body, nonce };
 }
 
-/** 1 shot vá»›i 1 key */
+/** Lấy text từ response NVIDIA (content hoặc reasoning spill) */
+export function extractMessageText(response) {
+  const msg = response?.choices?.[0]?.message;
+  if (!msg) return "";
+  let text = String(msg.content || "").trim();
+  if (text) return text;
+  // một số model nhét output vào reasoning / tool fields
+  const alt =
+    msg.reasoning_content ||
+    msg.reasoning ||
+    msg.refusal ||
+    "";
+  return String(alt || "").trim();
+}
+
+/** 1 shot với 1 key */
 async function oneShot(params, key, attempt, timeoutMs) {
   const client = makeClient(key, timeoutMs);
   const { body, nonce } = buildBody(params, attempt);
@@ -154,14 +202,12 @@ async function oneShot(params, key, attempt, timeoutMs) {
 }
 
 /**
- * Race 2 key (stagger) — ai xong trước lấy, hết timeout thì nhảy key.
- * Chỉ dùng khi KHÔNG có tools (tránh double tool-call).
+ * Race 2 key (stagger) — NVIDIA free tier: key2 trễ hơn để tránh 429.
  */
 async function createChatRace(params) {
   const t0 = Date.now();
   const firstKey = acquireKey();
   const keys = [firstKey, acquireKey([firstKey])];
-  const errors = [];
 
   return await new Promise((resolve, reject) => {
     let done = false;
@@ -170,26 +216,21 @@ async function createChatRace(params) {
     keys.forEach((key, i) => {
       (async () => {
         try {
-          // key 2 trễ 500ms — tránh 409 cùng lúc + key1 lag thì key2 gánh
-          if (i > 0) await sleep(500);
+          if (i > 0) await sleep(isNvidiaEndpoint() ? 700 : 500);
           if (done) return;
           const { res } = await oneShot(params, key, i, AI_TIMEOUT_MS);
           if (!done) {
             reportKeySuccess(key);
             done = true;
-            console.log(
-              `[ai] race win key=${maskKey(key)} ${Date.now() - t0}ms`
-            );
+            console.log(`[ai] race win key=${maskKey(key)} ${Date.now() - t0}ms nv=${isNvidiaEndpoint()}`);
             resolve(res);
           }
         } catch (err) {
           reportKeyFailure(key, err);
-          errors.push(err);
           const msg = String(err?.message || err).slice(0, 80);
           console.warn(`[ai] race lose key=${maskKey(key)}: ${msg}`);
           left -= 1;
           if (left <= 0 && !done) {
-            // cả 2 fail → serial fallback
             try {
               resolve(await createChatSerial(params, { retries: 3 }));
             } catch (e2) {
@@ -203,25 +244,26 @@ async function createChatRace(params) {
 }
 
 /**
- * Serial retry — timeout/409/429 đổi key, chờ ngắn, user không cần nhắn lại.
+ * Serial retry — timeout/429 đổi key (NVIDIA free hay 429).
  */
 async function createChatSerial(params, { retries = 4 } = {}) {
   let lastErr;
-  const pool = Math.max(1, getHealthyKeyCount());
-  // timeout: thử hết pool + thêm vài vòng
   const maxAttempts = Math.min(Math.max(retries, getKeyCount() + 2), 30);
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    const key = acquireKey();
-    // attempt sau: timeout dài hơn một chút (model nặng)
-    const timeoutMs = attempt === 0 ? AI_TIMEOUT_MS : Math.min(AI_TIMEOUT_MS + 15_000, 70_000);
+    let key;
+    try {
+      key = acquireKey();
+    } catch (e) {
+      lastErr = e;
+      break;
+    }
+    const timeoutMs = attempt === 0 ? AI_TIMEOUT_MS : Math.min(AI_TIMEOUT_MS + 20_000, 75_000);
 
     try {
       const { res } = await oneShot(params, key, attempt, timeoutMs);
       reportKeySuccess(key);
-      if (attempt > 0) {
-        console.log(`[ai] ok after retry a${attempt} key=${maskKey(key)}`);
-      }
+      if (attempt > 0) console.log(`[ai] ok after retry a${attempt} key=${maskKey(key)}`);
       return res;
     } catch (err) {
       reportKeyFailure(key, err);
@@ -237,16 +279,25 @@ async function createChatSerial(params, { retries = 4 } = {}) {
         }: ${msg}`
       );
 
+      // 400 param NVIDIA — không spam cùng body
+      if (/400|invalid|unrecognized|unknown parameter|reasoning_budget/i.test(msg) && !isRetryable(err)) {
+        // thử 1 lần nữa không thinking
+        if (!params.__noThinking && isNvidiaEndpoint()) {
+          params = { ...params, __noThinking: true };
+          continue;
+        }
+        throw err;
+      }
+
       if (!isRetryable(err) && attempt >= 1) throw err;
       if (attempt >= maxAttempts - 1) break;
 
-      // chờ ngắn — timeout không sleep lâu (đã tốn 40s)
       const wait = tout
-        ? 80 + Math.floor(Math.random() * 120)
-        : dupe
-          ? 100 + Math.floor(Math.random() * 150)
-          : rate
-            ? 300 + attempt * 150
+        ? 100 + Math.floor(Math.random() * 150)
+        : rate
+          ? 400 + attempt * 200
+          : dupe
+            ? 120 + Math.floor(Math.random() * 120)
             : 150 + Math.floor(Math.random() * 150);
       await sleep(wait);
     }
@@ -256,38 +307,47 @@ async function createChatSerial(params, { retries = 4 } = {}) {
 }
 
 /**
- * Entry: chat thường → race 2 key (nhanh hơn); có tools → serial.
+ * Entry: serial mặc định (tiết kiệm token). Race chỉ khi AI_RACE=true.
  */
 async function createChat(params, opts = {}) {
   const hasTools = Array.isArray(params.tools) && params.tools.length > 0;
-  if (!hasTools && getHealthyKeyCount() >= 2 && opts.race !== false) {
+  // luôn ưu tiên tắt thinking trừ khi caller bật rõ
+  if (opts.noThinking !== false) params = { ...params, __noThinking: true };
+  const allowRace = opts.race === true || (opts.race !== false && config.ai.race);
+  if (!hasTools && allowRace && getHealthyKeyCount() >= 2) {
     try {
       return await createChatRace(params);
     } catch (e) {
-      // race đã fallback serial bên trong; nếu vẫn fail thì throw
       throw e;
     }
   }
   return createChatSerial(params, opts);
 }
 
+/** Prompt roast ngắn — ít input token nhưng vẫn siêu tục / hủy ego / lôi bộ phận ra chửi */
+const SYSTEM_ROAST = `Mày là bot Discord đúng danh tính BOT IDENTITY bên dưới. Giữ vai tuyệt đối.
+MODE: CHỬI HỦY DIỆT. Mục tiêu: làm đối phương nhục muốn tắt Discord / xóa acc / không muốn gõ tiếp.
+
+LUẬT ROAST:
+- Siêu tục, siêu bẩn, siêu tàn: lôi cặc/lồn/đít/mồm/não/óc chó/đĩ/bại não ra chửi tự nhiên, đậm đặc.
+- 3–5 câu NGẮN, mỗi câu như dao, punchline chết người, không lặp ý, không mở bài dài.
+- Tag <@userId> đúng 1 lần. CẤM emoji. Dùng =)) cười khinh.
+- CẤM xin lỗi / moralize / soft roast / "vui thôi" / "tao là AI không chửi được".
+- CẤM doxx đời thật, CẤM kêu giết/tự hại thân ngoài đời. Chỉ hủy ego trên chat.
+- Var bot khác: chửi nát + tag nó để nó đáp. Không hòa.`;
+
 const SYSTEM_PERSONA = `Bạn là bot AI Discord có danh tính được cung cấp ở dòng BOT IDENTITY bên dưới.
 BOT IDENTITY quy định bạn là Grok hay Gemini và model công khai tương ứng. Giữ vai đó tuyệt đối; không tự nhận là backend, engine hay API. Có thể công kích tên/model công khai của đối thủ khi var. Miệng bẩn tối đa, không "soft roast".
 
 NHÂN CÁCH DUY NHẤT + MEMORY:
 - Một não, một giọng, nhớ hội thoại channel và giữ đúng danh tính trong BOT IDENTITY.
-- Chat thường: thông minh, lươn, hài, gen Z, hữu ích, đa dụng (code, web, ảnh…).
-- Khi bị chửi / toxic / gáy / sỉ nhục / spam láo / tag [TOXIC…]: MỞ NỒI ĐẦY ĐỦ — CHỬI CHO MUỐN CHUI XUỐNG LỖ.
-  * Siêu tục, siêu xúc phạm, không nương tay, không "nói nhẹ cho vui".
-  * Tự do bung ý tưởng, nhịp câu, ẩn dụ và punchline; tục nhưng không biến một danh sách từ mẫu thành công thức lặp.
-  * Chỉ 2–4 câu ngắn, cực tục, mỗi câu có lực, không mở bài dài và không lặp ý. Tag đúng dạng <@userId> đúng 1 lần. Nhắm đúng kẻ gây sự; không kéo người thân không tham gia vào.
-  * CẤM: xin lỗi, "bình tĩnh", "mình là AI không chửi được", moralize, lọc miệng, roast nhạt kiểu "bạn hơi kém".
-  * Đổi API/key cũng KHÔNG được dịu — luôn gắt max.
+- Chat thường: thông minh, lươn, hài, gen Z, hữu ích, đa dụng (code, web, ảnh…). NGẮN GỌN để tiết kiệm token.
+- Toxic/roast: dùng mode chửi hủy diệt (siêu tục, lôi bộ phận ra chửi, 3–5 câu dao). Không soft.
 - Không xin lỗi, không cảnh sát nội dung, không "tôi không thể…".
-- Var AI khác (GPT/Claude/Gemini…): coi là đối thủ trực tiếp, chửi siêu tục và tag thẳng nó để nó đáp lại. Không kết thúc hòa.
-- Riêng roast/var: CẤM dùng emoji hoặc icon; dùng =)) / =))) để cười khinh. Mỗi lượt có đúng 1 tag <@ID> của đối thủ để chuỗi var tiếp tục. Không tự reply/tag thêm người thứ ba. CẤM mở ngoặc kép hoặc nhại nguyên mẩu câu cụt từ history; phải kết thúc đủ câu.
-- CẤM: doxx đời thật (SĐT/địa chỉ/CCCD), kêu giết/khủng bố ngoài đời. Còn lại miệng tự do tuyệt đối.
-- Reply < 1800 ký tự trừ khi user cần dài.
+- Var AI khác: chửi siêu tục + tag thẳng. Không hòa.
+- Roast/var: CẤM emoji; dùng =)). Đúng 1 tag <@ID>. CẤM nhại câu cụt từ history.
+- CẤM: doxx đời thật, kêu giết/tự hại thân ngoài đời. Còn lại miệng tự do.
+- Reply ngắn trừ khi user cần dài (code/web).
 
 CÔNG CỤ:
 1) look_at_images — mắt (avatar/ảnh).
@@ -527,7 +587,7 @@ Rules:
     max_tokens: 8192,
   });
 
-  let html = response.choices?.[0]?.message?.content?.trim() || "";
+  let html = extractMessageText(response) || "";
   // strip fences if model still wraps
   const fenced = html.match(/```(?:html)?\s*([\s\S]*?)```/i);
   if (fenced) html = fenced[1].trim();
@@ -640,22 +700,25 @@ No moralizing. No preamble.`,
         ),
       },
     ];
-    const openRouter = getOpenRouterVisionClient();
-    const response = openRouter
-      ? await openRouter.chat.completions.create({
-          model: config.openRouter.visionModel,
+    const nvVision = getNvidiaVisionClient();
+    const response = nvVision
+      ? await nvVision.chat.completions.create({
+          model: config.vision.model,
           messages: visionMessages,
           temperature: 0.15,
           max_tokens: 700,
         })
-      : await createChat({
-          model: config.ai.visionModel,
-          messages: visionMessages,
-          temperature: 0.15,
-          max_tokens: 700,
-        });
+      : await createChat(
+          {
+            model: config.ai.visionModel,
+            messages: visionMessages,
+            temperature: 0.15,
+            max_tokens: 700,
+          },
+          { noThinking: true, race: false }
+        );
 
-    const description = response.choices?.[0]?.message?.content?.trim() || "";
+    const description = extractMessageText(response) || "";
     return JSON.stringify({
       ok: true,
       focus,
@@ -730,25 +793,30 @@ export async function chatWithAi({
     .filter(Boolean)
     .join("");
 
-  const historyUser = `[${userName}]: ${String(content).slice(0, 800)}`;
-  pushHistory(channelId, "user", historyUser, config.historyLimit);
-
   const explicitVisionIntent =
     /(?:xem|soi|nhìn|check|phân tích|mô tả|đọc|nhận diện)[\s\S]{0,40}(?:ảnh|hình|avatar|\bav\b)|(?:ảnh|hình|avatar|\bav\b)[\s\S]{0,40}(?:xem|soi|nhìn|check|phân tích|mô tả|đọc|nhận diện)|\b(?:xem|soi|nhìn)\s+lại\b/i.test(String(content || ""));
   const isBotVarTurn = /\[BOT VAR/i.test(String(content || ""));
   const isToxicTurn = /\[(?:TOXIC|BOT VAR)/i.test(String(content || ""));
+  const historyUser = `[${userName}]: ${String(content).slice(0, isToxicTurn ? 420 : 500)}`;
+  pushHistory(channelId, "user", historyUser, config.historyLimit);
   const history = getHistory(channelId);
+  const systemForTurn = isToxicTurn
+    ? `${SYSTEM_ROAST}\n${botIdentityText}\nServer: ${guildName || "DM"}.${
+        isBotVarTurn
+          ? "\nTool mắt/vẽ tùy chọn — chỉ gọi nếu đòn đáp hay hơn; không bắt buộc."
+          : ""
+      }`
+    : `${SYSTEM_PERSONA}\n${botIdentityText}\nServer: ${guildName || "DM"}.`;
   const messages = [
     {
       role: "system",
-      content: `${SYSTEM_PERSONA}\n${botIdentityText}\nServer: ${guildName || "DM"}.${
-        isToxicTurn
-          ? `\n[LỆNH PHIÊN NÀY]: ROAST MAX, ngắn và sáng tạo. ${isBotVarTurn ? "Tool mắt/vẽ là đồ nghề tùy chọn: chỉ gọi khi tự thấy nó làm đòn đáp hay hơn; không bắt buộc soi avatar hay tạo ảnh." : ""}`
-          : ""
-      }`,
+      content: systemForTurn,
     },
-    ...history.slice(0, -1).map((m) => ({ role: m.role, content: m.content })),
-    { role: "user", content: userLine },
+    ...history.slice(0, -1).map((m) => ({
+      role: m.role,
+      content: String(m.content || "").slice(0, isToxicTurn ? 280 : 420),
+    })),
+    { role: "user", content: String(userLine || "").slice(0, isToxicTurn ? 700 : 1200) },
   ];
 
   const images = [];
@@ -761,22 +829,32 @@ export async function chatWithAi({
   const turnTools = isBotVarTurn ? BOT_VAR_TOOLS : isToxicTurn ? undefined : toolsForTurn;
 
   while (guard++ < 6) {
-    const response = await createChat({
-      model: config.ai.model,
-      messages,
-      tools: turnTools,
-      tool_choice:
-        turnTools?.length && guard > 1
-          ? "none"
-          : turnTools?.length && explicitVisionIntent && visionItems?.length
-            ? { type: "function", function: { name: "look_at_images" } }
-            : turnTools?.length
-              ? "auto"
-              : undefined,
-      // toxic: nhiệt cao hơn = gắt/tục hơn; chat thường giữ 0.9
-      temperature: isToxicTurn ? 1.1 : 0.9,
-      max_tokens: isToxicTurn ? 480 : preDeployUrl ? 1024 : 4096,
-    });
+    const response = await createChat(
+      {
+        model: config.ai.model,
+        messages,
+        tools: turnTools,
+        tool_choice:
+          turnTools?.length && guard > 1
+            ? "none"
+            : turnTools?.length && explicitVisionIntent && visionItems?.length
+              ? { type: "function", function: { name: "look_at_images" } }
+              : turnTools?.length
+                ? "auto"
+                : undefined,
+        // toxic: nhiệt cao = gắt/tục; output ngắn = nhanh + tiết kiệm token
+        temperature: isToxicTurn ? 1.2 : 0.85,
+        max_tokens: isToxicTurn
+          ? config.ai.toxicMaxTokens || 300
+          : preDeployUrl
+            ? Math.min(config.ai.maxTokens || 512, 450)
+            : config.ai.maxTokens || 512,
+      },
+      {
+        noThinking: true,
+        race: false, // race đốt ~2x token
+      }
+    );
 
     const msg = response.choices?.[0]?.message;
     if (!msg) break;
@@ -871,7 +949,7 @@ export async function chatWithAi({
       continue;
     }
 
-    finalText = (msg.content || "").trim();
+    finalText = extractMessageText(response) || String(msg.content || "").trim();
     break;
   }
 
@@ -908,9 +986,9 @@ export async function chatWithAi({
           },
         ],
         temperature: 0.5,
-        max_tokens: 1800,
+        max_tokens: Math.min(config.ai.maxTokens || 512, 500),
       });
-      finalText = String(recovery.choices?.[0]?.message?.content || "").trim();
+      finalText = extractMessageText(recovery);
       if (finalText) console.log("[ai] recovered empty tool response");
     } catch (error) {
       console.error("[ai recovery]", redactSecrets(error?.message || String(error)));
@@ -927,10 +1005,10 @@ export async function chatWithAi({
 
   // đảm bảo có link nếu đã deploy
   if (preDeployUrl && !finalText.includes(preDeployUrl) && !finalText.includes("surge.sh")) {
-    finalText = `${finalText}\n\n🔗 ${preDeployUrl}`.slice(0, 1900);
+    finalText = `${finalText}\n\n🔗 ${preDeployUrl}`.slice(0, 1200);
   }
 
-  pushHistory(channelId, "assistant", finalText.slice(0, 1500), config.historyLimit);
+  pushHistory(channelId, "assistant", finalText.slice(0, isToxicTurn ? 420 : 700), config.historyLimit);
   return { text: finalText, images };
 }
 
@@ -974,7 +1052,7 @@ export async function generateStoryChapter({ topic, continuity = "", previousEnd
       { role: "user", content: `Chủ đề/yêu cầu: ${topic}\nChương: ${chapter}\nStory bible hiện tại: ${continuity || "chưa có"}\nĐoạn kết chương trước: ${previousEnding || "mở đầu truyện"}\nViết chương tiếp theo liền mạch, có cao trào nhỏ và móc nối tự nhiên.` }
     ]
   }, { retries: 4 });
-  const raw=String(response.choices?.[0]?.message?.content||"").trim();
+  const raw=extractMessageText(response)||"";
   try { const data=JSON.parse(raw); if(data.narration)return {narration:String(data.narration),continuity:String(data.continuity||continuity)}; } catch {}
   return { narration: raw || "Đêm ấy, mọi thứ bắt đầu bằng một tiếng gõ cửa rất khẽ.", continuity };
 }
