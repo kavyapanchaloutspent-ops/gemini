@@ -39,7 +39,7 @@ export const config = {
     visionModel: process.env.AI_VISION_MODEL || "nvidia/nemotron-3-ultra-550b-a55b",
     reasoningBudget: Number(process.env.AI_REASONING_BUDGET || 1024),
     maxTokens: Number(process.env.AI_MAX_TOKENS || 1024),
-    toxicMaxTokens: Number(process.env.AI_TOXIC_MAX_TOKENS || 320),
+    toxicMaxTokens: Number(process.env.AI_TOXIC_MAX_TOKENS || 480),
     /** toxic/fast auto tắt; chat thường có thể bật */
     enableThinking: String(process.env.AI_ENABLE_THINKING ?? "false").toLowerCase() !== "false",
     race: String(process.env.AI_RACE ?? "false").toLowerCase() === "true",
