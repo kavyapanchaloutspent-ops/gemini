@@ -9,7 +9,7 @@ import {
 } from "discord.js";
 import { config } from "./config.js";
 import { isLaughing, LAUGH_REPLY } from "./laugh.js";
-import { isRoastTrigger } from "./roast.js";
+import { isRoastTrigger, pickFallbackRoast } from "./roast.js";
 import { chatWithAi } from "./ai.js";
 import { gatherIntel } from "./profile.js";
 import { isStaff, clearWarnings, getUserRecord } from "./moderation.js";
@@ -312,10 +312,18 @@ client.on(Events.MessageCreate, async (message) => {
   } catch (err) {
     console.error("[message]", err);
     try {
+      if (typeof toxic !== "undefined" && toxic) {
+        const roast = `<@${message.author.id}> ${pickFallbackRoast(5)}`;
+        await message.reply({
+          content: roast,
+          allowedMentions: { repliedUser: !isBotVar, users: [message.author.id], parse: [] },
+        });
+        return;
+      }
       const raw = String(err?.message || err);
-      const soft = /timed?\s*out|timeout/i.test(raw)
-        ? "API lag/timeout — tao đang đổi key thử lại trong đầu nhưng hết lượt. **Nhắn lại 1 cái** (hoặc `.api list` xem còn key không)."
-        : `lỗi não bot: \`${raw.slice(0, 180)}\``;
+      const soft = /timed?\s*out|timeout|edge function/i.test(raw)
+        ? "API Nexus đang lag — nhắn lại 1 cái giúp tao."
+        : `lỗi não bot: \`${raw.slice(0, 160)}\``;
       await message.reply(soft);
     } catch {
       /* ignore */

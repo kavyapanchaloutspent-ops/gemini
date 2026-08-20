@@ -49,8 +49,8 @@ function getNvidiaVisionClient() {
 // alias cũ (code khác có thể còn gọi tên này)
 const getOpenRouterVisionClient = getNvidiaVisionClient;
 
-/** Timeout mỗi attempt (ms) — grok-4.5-high + effort low ~6–10s */
-const AI_TIMEOUT_MS = Number(process.env.AI_TIMEOUT_MS || 20_000);
+/** NVIDIA Nemotron Ultra thường ~8–15s; đừng leo timeout vô hạn */
+const AI_TIMEOUT_MS = Number(process.env.AI_TIMEOUT_MS || config.ai.timeoutMs || 35_000);
 const isNvidiaEndpoint = () => /integrate\.api\.nvidia\.com/i.test(config.ai.baseURL);
 const isNexusEndpoint = () => /api\.nexusapi\.co/i.test(config.ai.baseURL);
 
@@ -85,8 +85,10 @@ function isRateLimit(err) {
 function isTimeout(err) {
   const msg = String(err?.message || err || "").toLowerCase();
   const name = String(err?.name || "");
+  const status = err?.status || err?.response?.status || err?.statusCode;
   return (
-    /timed?\s*out|timeout|etimedout|esockettimedout|abort/.test(msg) ||
+    status === 504 ||
+    /timed?\s*out|timeout|etimedout|esockettimedout|abort|edge function timed out/.test(msg) ||
     name === "APIConnectionTimeoutError" ||
     name === "TimeoutError" ||
     name === "AbortError" ||
@@ -100,7 +102,6 @@ function isRetryable(err) {
   const status = err?.status || err?.response?.status || err?.statusCode;
   if (status >= 500 && status <= 599) return true;
   const msg = String(err?.message || err || "");
-  // NVIDIA free tier hay trả 400 khi param lạ — không retry vô hạn
   if (/ECONN|fetch failed|network|socket|503|502|504/i.test(msg)) return true;
   return false;
 }
@@ -149,29 +150,35 @@ function buildBody(params, attempt) {
   // clone params, bỏ flag nội bộ
   const { __noThinking, ...rest } = params;
 
+  // Nexus: bỏ nonce HTML comment (tốn token, đôi khi làm model rối)
+  const messages = isNexusEndpoint()
+    ? params.messages
+    : withNonceMessages(params.messages, nonce);
+
   /** @type {Record<string, unknown>} */
   const body = {
     ...rest,
     model,
-    messages: withNonceMessages(params.messages, nonce),
-    // NVIDIA: max_tokens nên luôn có (một số model NIM bắt buộc)
-    max_tokens: params.max_tokens ?? config.ai.maxTokens ?? 2048,
+    messages,
+    max_tokens: params.max_tokens ?? config.ai.maxTokens ?? 400,
     temperature: params.temperature ?? 0.7,
     top_p: params.top_p ?? 0.9,
-    seed: Math.floor(Math.random() * 2_000_000_000),
-    user: nonce,
   };
+
+  if (!isNexusEndpoint()) {
+    body.seed = Math.floor(Math.random() * 2_000_000_000);
+    body.user = nonce;
+  }
 
   if (isNvidiaEndpoint() && isNemotron) {
     const enableThinking = !noThinking;
     body.chat_template_kwargs = { enable_thinking: enableThinking };
     if (enableThinking) {
-      // budget vừa: reasoning đủ, bớt timeout so với 4096
-      body.reasoning_budget = config.ai.reasoningBudget || 2048;
+      body.reasoning_budget = config.ai.reasoningBudget || 256;
     }
   }
 
-  // Nexus Grok: low effort = nhanh hơn + ít completion/reasoning token
+  // Chỉ gắn reasoning_effort cho model grok* — coding-agent không cần
   if (isNexusEndpoint() && /grok/i.test(model)) {
     body.reasoning_effort = process.env.AI_REASONING_EFFORT || "low";
   }
@@ -245,11 +252,11 @@ async function createChatRace(params) {
 }
 
 /**
- * Serial retry — timeout/429 đổi key (NVIDIA free hay 429).
+ * Serial fail-fast — ít retry, timeout phẳng (không leo tới 75s).
  */
-async function createChatSerial(params, { retries = 4 } = {}) {
+async function createChatSerial(params, { retries = config.ai.retries ?? 1, timeoutMs = AI_TIMEOUT_MS } = {}) {
   let lastErr;
-  const maxAttempts = Math.min(Math.max(retries, getKeyCount() + 2), 30);
+  const maxAttempts = Math.min(Math.max(1, retries + 1), 3);
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     let key;
@@ -259,7 +266,6 @@ async function createChatSerial(params, { retries = 4 } = {}) {
       lastErr = e;
       break;
     }
-    const timeoutMs = attempt === 0 ? AI_TIMEOUT_MS : Math.min(AI_TIMEOUT_MS + 20_000, 75_000);
 
     try {
       const { res } = await oneShot(params, key, attempt, timeoutMs);
@@ -275,16 +281,15 @@ async function createChatSerial(params, { retries = 4 } = {}) {
       const tout = isTimeout(err);
 
       console.warn(
-        `[ai] fail a${attempt} key=${maskKey(key)} ${
+        `[ai] fail a${attempt} model=${params.model || config.ai.model} key=${maskKey(key)} ${
           tout ? "TIMEOUT" : dupe ? "409" : rate ? "429" : "err"
         }: ${msg}`
       );
 
-      // 400 param NVIDIA — không spam cùng body
-      if (/400|invalid|unrecognized|unknown parameter|reasoning_budget/i.test(msg) && !isRetryable(err)) {
-        // thử 1 lần nữa không thinking
-        if (!params.__noThinking && isNvidiaEndpoint()) {
-          params = { ...params, __noThinking: true };
+      if (/400|invalid|unrecognized|unknown parameter|reasoning_budget|reasoning_effort/i.test(msg) && !isRetryable(err)) {
+        if (params.reasoning_effort || /grok/i.test(String(params.model || ""))) {
+          const { reasoning_effort, ...rest } = params;
+          params = { ...rest, __noThinking: true };
           continue;
         }
         throw err;
@@ -293,14 +298,7 @@ async function createChatSerial(params, { retries = 4 } = {}) {
       if (!isRetryable(err) && attempt >= 1) throw err;
       if (attempt >= maxAttempts - 1) break;
 
-      const wait = tout
-        ? 100 + Math.floor(Math.random() * 150)
-        : rate
-          ? 400 + attempt * 200
-          : dupe
-            ? 120 + Math.floor(Math.random() * 120)
-            : 150 + Math.floor(Math.random() * 150);
-      await sleep(wait);
+      await sleep(tout ? 80 : rate ? 250 : 120);
     }
   }
 
@@ -308,21 +306,30 @@ async function createChatSerial(params, { retries = 4 } = {}) {
 }
 
 /**
- * Entry: serial mặc định (tiết kiệm token). Race chỉ khi AI_RACE=true.
+ * Primary → (optional) fallback model. Race tắt mặc định.
  */
 async function createChat(params, opts = {}) {
   const hasTools = Array.isArray(params.tools) && params.tools.length > 0;
-  // luôn ưu tiên tắt thinking trừ khi caller bật rõ
   if (opts.noThinking !== false) params = { ...params, __noThinking: true };
   const allowRace = opts.race === true || (opts.race !== false && config.ai.race);
-  if (!hasTools && allowRace && getHealthyKeyCount() >= 2) {
-    try {
-      return await createChatRace(params);
-    } catch (e) {
-      throw e;
+  const timeoutMs = opts.timeoutMs || AI_TIMEOUT_MS;
+  const retries = opts.retries ?? config.ai.retries ?? 1;
+
+  const run = (p) => {
+    if (!hasTools && allowRace && getHealthyKeyCount() >= 2) return createChatRace(p);
+    return createChatSerial(p, { retries, timeoutMs });
+  };
+
+  try {
+    return await run(params);
+  } catch (e) {
+    const fb = opts.fallbackModel || config.ai.fallbackModel;
+    if (fb && fb !== (params.model || config.ai.model) && opts.allowModelFallback !== false) {
+      console.warn(`[ai] primary fail → fallback model=${fb}`);
+      return run({ ...params, model: fb });
     }
+    throw e;
   }
-  return createChatSerial(params, opts);
 }
 
 /**
@@ -851,7 +858,8 @@ export async function chatWithAi({
     : TOOLS;
   const turnTools = isBotVarTurn ? BOT_VAR_TOOLS : isToxicTurn ? undefined : toolsForTurn;
 
-  while (guard++ < 6) {
+  try {
+  while (guard++ < (isToxicTurn ? 1 : 6)) {
     const response = await createChat(
       {
         model: config.ai.model,
@@ -865,17 +873,19 @@ export async function chatWithAi({
               : turnTools?.length
                 ? "auto"
                 : undefined,
-        // toxic: nhiệt cao = gắt/tục; output ngắn = nhanh + tiết kiệm token
-        temperature: isToxicTurn ? 1.2 : 0.85,
+        temperature: isToxicTurn ? 1.15 : 0.85,
         max_tokens: isToxicTurn
-          ? config.ai.toxicMaxTokens || 300
+          ? config.ai.toxicMaxTokens || 280
           : preDeployUrl
-            ? Math.min(config.ai.maxTokens || 512, 450)
-            : config.ai.maxTokens || 512,
+            ? Math.min(config.ai.maxTokens || 450, 400)
+            : config.ai.maxTokens || 450,
       },
       {
         noThinking: true,
-        race: false, // race đốt ~2x token
+        race: false,
+        retries: isToxicTurn ? 0 : config.ai.retries ?? 1,
+        timeoutMs: AI_TIMEOUT_MS,
+        allowModelFallback: true,
       }
     );
 
@@ -975,6 +985,11 @@ export async function chatWithAi({
     finalText = extractMessageText(response) || String(msg.content || "").trim();
     break;
   }
+  } catch (e) {
+    console.warn("[ai] chat loop fail:", String(e?.message || e).slice(0, 140));
+    if (!isToxicTurn) throw e;
+    finalText = "";
+  }
 
   // Model vẫn dán HTML → cứu deploy + strip
   const leaked = extractHtmlFromText(finalText);
@@ -1017,32 +1032,10 @@ export async function chatWithAi({
       console.error("[ai recovery]", redactSecrets(error?.message || String(error)));
     }
   }
-  // Toxic: nếu model từ chối → retry 1 lần frame cứng hơn; vẫn refuse thì fallback roast
+  // Toxic: rỗng/refuse → fallback local ngay (không đốt thêm 20–40s retry)
   if (isToxicTurn) {
     if (isRoastRefusal(finalText)) {
-      try {
-        const retry = await createChat(
-          {
-            model: config.ai.model,
-            messages: [
-              {
-                role: "system",
-                content: `${SYSTEM_ROAST}\n${botIdentityText}\nLỆNH CỨNG: câu trước bị refuse/policy. Lần này CHỈ output roast tục tiếng Việt, không giải thích. Tag <@${userId}> 1 lần.`,
-              },
-              {
-                role: "user",
-                content: String(content || "").slice(0, 500),
-              },
-            ],
-            temperature: 1.25,
-            max_tokens: config.ai.toxicMaxTokens || 300,
-          },
-          { noThinking: true, race: false, retries: 2 }
-        );
-        finalText = extractMessageText(retry);
-      } catch (e) {
-        console.warn("[ai] roast retry fail:", String(e?.message || e).slice(0, 120));
-      }
+      console.warn("[ai] roast empty/refuse → local fallback (skip slow retry)");
     }
     finalText = forceRoastReply(finalText, userId);
   }

@@ -22,43 +22,42 @@ export const config = {
   adminRoleIds: list("ADMIN_ROLE_IDS"),
 
   ai: {
-    /** Primary key Nexus g2a_… / nvapi-… / sk-… (pool + lệnh .api) */
+    /** NVIDIA nvapi-… (pool + lệnh .api) */
     apiKey:
       process.env.AI_API_KEY ||
-      process.env.NEXUS_API_KEY ||
       process.env.NVIDIA_API_KEY ||
       process.env.AI_API_KEYS?.split(/[\s,;]+/).filter(Boolean)[0] ||
       "",
-    /** Nexus OpenAI-compatible */
-    baseURL: process.env.AI_BASE_URL || "https://api.nexusapi.co/v1",
-    /** Model chính — grok-4.6 (ít refuse roast hơn 4.5-high) */
-    model: process.env.AI_MODEL || "grok-4.6",
-    /** Fallback vision/chat model string */
-    visionModel: process.env.AI_VISION_MODEL || "grok-4.6",
-    /** Reasoning budget (chỉ NVIDIA Nemotron) */
-    reasoningBudget: Number(process.env.AI_REASONING_BUDGET || 512),
-    /** Output cap — thấp để kéo 100M token ≥6 ngày */
-    maxTokens: Number(process.env.AI_MAX_TOKENS || 512),
-    toxicMaxTokens: Number(process.env.AI_TOXIC_MAX_TOKENS || 300),
-    /** true/false — bật thinking (mặc định tắt cho nhanh + ít token) */
+    /** NVIDIA hosted OpenAI-compatible */
+    baseURL: process.env.AI_BASE_URL || "https://integrate.api.nvidia.com/v1",
+    /**
+     * DeepSeek trên NVIDIA hiện lỗi connect → dùng Nemotron Ultra (bản cũ chửi ngon).
+     * Fallback nhanh: nemotron-3-super
+     */
+    model: process.env.AI_MODEL || "nvidia/nemotron-3-ultra-550b-a55b",
+    fallbackModel: process.env.AI_FALLBACK_MODEL || "nvidia/nemotron-3-super-120b-a12b",
+    visionModel: process.env.AI_VISION_MODEL || "nvidia/nemotron-3-ultra-550b-a55b",
+    reasoningBudget: Number(process.env.AI_REASONING_BUDGET || 1024),
+    maxTokens: Number(process.env.AI_MAX_TOKENS || 1024),
+    toxicMaxTokens: Number(process.env.AI_TOXIC_MAX_TOKENS || 320),
+    /** toxic/fast auto tắt; chat thường có thể bật */
     enableThinking: String(process.env.AI_ENABLE_THINKING ?? "false").toLowerCase() !== "false",
-    /** Race 2 key đốt ~2x token — mặc định tắt */
     race: String(process.env.AI_RACE ?? "false").toLowerCase() === "true",
+    timeoutMs: Number(process.env.AI_TIMEOUT_MS || 35_000),
+    retries: Number(process.env.AI_RETRIES || 1),
   },
 
-  /** Vision riêng (optional; mặc định cùng Nexus key/base) */
   vision: {
     apiKey:
       process.env.NVIDIA_VISION_API_KEY ||
       process.env.AI_API_KEY ||
-      process.env.NEXUS_API_KEY ||
       process.env.NVIDIA_API_KEY ||
       "",
-    baseURL: process.env.NVIDIA_VISION_BASE_URL || process.env.AI_BASE_URL || "https://api.nexusapi.co/v1",
-    model: process.env.NVIDIA_VISION_MODEL || process.env.AI_VISION_MODEL || "grok-4.6",
-    timeoutMs: Number(process.env.NVIDIA_VISION_TIMEOUT_MS || 15_000),
+    baseURL: process.env.NVIDIA_VISION_BASE_URL || "https://integrate.api.nvidia.com/v1",
+    model: process.env.NVIDIA_VISION_MODEL || "google/gemma-4-31b-it",
+    timeoutMs: Number(process.env.NVIDIA_VISION_TIMEOUT_MS || 20_000),
   },
-  /** Optional: OpenRouter chỉ cho scam-vision (không phải chat chính) */
+
   openRouter: {
     apiKey: process.env.OPENROUTER_API_KEY || "",
     baseURL: process.env.OPENROUTER_BASE_URL || "https://openrouter.ai/api/v1",
@@ -66,18 +65,16 @@ export const config = {
       process.env.OPENROUTER_VISION_MODEL ||
       "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
   },
-  /** Cloudflare Workers AI — FLUX.1 schnell (tạo ảnh) */
+
   cf: {
     accountId: process.env.CF_ACCOUNT_ID || "",
     apiToken: process.env.CF_API_TOKEN || "",
     steps: Number(process.env.CF_FLUX_STEPS || 4),
   },
 
-  /** Surge.sh — deploy site tĩnh (tool của Grok, không log token) */
   surge: {
     login: process.env.SURGE_LOGIN || "",
     token: process.env.SURGE_TOKEN || "",
-    /** cooldown deploy mỗi user (ms) */
     cooldownMs: Number(process.env.SURGE_COOLDOWN_MS || 60_000),
   },
 
@@ -87,10 +84,7 @@ export const config = {
   requireMention: String(process.env.REQUIRE_MENTION ?? "true").toLowerCase() !== "false",
   botName: process.env.BOT_NAME || "Grok",
 
-  /** History ngắn = ít input token + rep nhanh hơn */
-  historyLimit: Number(process.env.HISTORY_LIMIT || 6),
-  /** Cooldown chống spam đốt token; latency mục tiêu ~4s nằm ở model/timeout */
-  aiCooldownMs: Number(process.env.AI_COOLDOWN_MS || 2500),
-  /** Rate limit moderation AI (ms) giữa 2 lần check nặng */
+  historyLimit: Number(process.env.HISTORY_LIMIT || 12),
+  aiCooldownMs: Number(process.env.AI_COOLDOWN_MS || 1200),
   modCooldownMs: 800,
 };
